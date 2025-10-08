@@ -1,0 +1,109 @@
+name: Sync and Update M3U8 Data
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run twice daily at 6 AM and 6 PM UTC
+    - cron: '0 6,18 * * *'
+  push:
+    paths:
+      - 'streams/us_moveonjoy.m3u'
+
+jobs:
+  sync-and-notify:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup git
+        run: |
+          git config user.name "sportika-bot[bot]"
+          git config user.email "sportika-bot[bot]@users.noreply.github.com"
+      
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/iptv-org/iptv.git || true
+          git fetch upstream
+      
+      - name: Check for changes in upstream
+        id: check_changes
+        run: |
+          # Get the latest commit hash from upstream master
+          UPSTREAM_HASH=$(git rev-parse upstream/master)
+          CURRENT_HASH=$(git rev-parse HEAD)
+          
+          echo "upstream_hash=$UPSTREAM_HASH" >> $GITHUB_OUTPUT
+          echo "current_hash=$CURRENT_HASH" >> $GITHUB_OUTPUT
+          
+          if [ "$UPSTREAM_HASH" != "$CURRENT_HASH" ]; then
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+            echo "Changes detected in upstream repository"
+          else
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            echo "No changes detected"
+          fi
+      
+      - name: Merge upstream changes
+        if: steps.check_changes.outputs.changes_detected == 'true'
+        run: |
+          git merge upstream/master --no-edit
+      
+      - name: Check if us_moveonjoy.m3u changed
+        id: check_moveonjoy
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -q "streams/us_moveonjoy.m3u"; then
+            echo "moveonjoy_changed=true" >> $GITHUB_OUTPUT
+            echo "us_moveonjoy.m3u file has changed"
+          else
+            echo "moveonjoy_changed=false" >> $GITHUB_OUTPUT
+            echo "us_moveonjoy.m3u file has not changed"
+          fi
+      
+      - name: Push changes
+        if: steps.check_changes.outputs.changes_detected == 'true'
+        run: |
+          git push origin master
+      
+      - name: Notify Django app via webhook
+        if: steps.check_moveonjoy.outputs.moveonjoy_changed == 'true'
+        run: |
+          # Get the raw URL for the us_moveonjoy.m3u file
+          RAW_URL="https://raw.githubusercontent.com/${{ github.repository }}/master/streams/us_moveonjoy.m3u"
+          
+          # Create webhook payload
+          PAYLOAD=$(cat <<EOF
+          {
+            "repository": "${{ github.repository }}",
+            "ref": "${{ github.ref }}",
+            "file_url": "$RAW_URL",
+            "file_path": "streams/us_moveonjoy.m3u",
+            "action": "m3u8_updated",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          )
+          
+          # Send webhook if URL is configured
+          if [ -n "${{ secrets.WEBHOOK_URL }}" ]; then
+            curl -X POST \
+              -H "Content-Type: application/json" \
+              -H "X-Hub-Signature-256: sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" | cut -d' ' -f2)" \
+              -d "$PAYLOAD" \
+              "${{ secrets.WEBHOOK_URL }}"
+            echo "Webhook sent to Django app"
+          else
+            echo "WEBHOOK_URL not configured, skipping webhook notification"
+          fi
+      
+      - name: Commit summary
+        if: steps.check_changes.outputs.changes_detected == 'true'
+        run: |
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream hash**: ${{ steps.check_changes.outputs.upstream_hash }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous hash**: ${{ steps.check_changes.outputs.current_hash }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **MoveOnJoy file changed**: ${{ steps.check_moveonjoy.outputs.moveonjoy_changed }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Webhook sent**: ${{ steps.check_moveonjoy.outputs.moveonjoy_changed == 'true' && secrets.WEBHOOK_URL != '' }}" >> $GITHUB_STEP_SUMMARY
